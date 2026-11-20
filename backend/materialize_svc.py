@@ -1,13 +1,14 @@
-"""关窗后物化。空桩预留：分区失败回滚 vs 保留成功分区。"""
+"""关窗后物化（甲路径：业务行与 materialize_ok 审计同事务，缺审计整笔回滚）。"""
 from __future__ import annotations
 
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
+from audit_gate import AuditMissing, commit_with_audit
 from auth import AuthHeader, require_user
-from db import connect, write_audit
-from locks import release, require_lock
+from db import connect
+from locks import deny_on_contention, release
 from models import MaterializeIn
 
 router = APIRouter(tags=["materialize"])
@@ -22,12 +23,25 @@ def materialize(
     user = require_user(authorization)
     lock_key = f"materialize:{wid}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        # 两人同时触发同一物化：后到只记争用（争用本身同事务有审计）并 409
+        deny_on_contention(conn, lock_key, user, biz_action="materialize")
         try:
             w = conn.execute("SELECT * FROM windows WHERE id=?", (wid,)).fetchone()
             if not w:
+                conn.rollback()
                 raise HTTPException(404, "窗口不存在")
             if w["status"] != "已关闭":
+                # 拒写不产生业务行，但留 materialize_denied 审计（同事务）
+                try:
+                    commit_with_audit(
+                        conn,
+                        user,
+                        "materialize_denied",
+                        str(wid),
+                        {"reason": "未关窗不能物化", "lock_key": lock_key},
+                    )
+                except AuditMissing as exc:
+                    raise HTTPException(500, str(exc)) from exc
                 raise HTTPException(409, "未关窗不能物化")
             now = datetime.now().isoformat(timespec="seconds")
             rows = conn.execute(
@@ -37,29 +51,41 @@ def materialize(
             ).fetchone()
             partition = body.partition_key or f"{w['name']}-g{w['generation']}"
             if body.fail_simulate:
-                write_audit(
-                    conn,
-                    user,
-                    "materialize_fail_sim",
-                    str(wid),
-                    {"partition": partition},
-                )
-                conn.commit()
+                try:
+                    commit_with_audit(
+                        conn,
+                        user,
+                        "materialize_fail_sim",
+                        str(wid),
+                        {"partition": partition, "lock_key": lock_key},
+                    )
+                except AuditMissing as exc:
+                    raise HTTPException(500, str(exc)) from exc
                 raise HTTPException(500, "模拟物化失败（夹具用）")
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO materializations(window_id,status,row_count,total_amount,partition_key,created_at)
                    VALUES (?,?,?,?,?,?)""",
                 (wid, "成功", rows["c"], rows["s"], partition, now),
             )
-            write_audit(
-                conn,
-                user,
-                "materialize_ok",
-                str(wid),
-                {"row_count": rows["c"], "total_amount": rows["s"], "partition": partition},
-            )
-            conn.commit()
+            mat_id = int(cur.lastrowid)
+            # 唯一提交口：审计同事务插入+回查+COMMIT；审计失败 → 回滚，业务零改
+            try:
+                commit_with_audit(
+                    conn,
+                    user,
+                    "materialize_ok",
+                    str(wid),
+                    {
+                        "mat_id": mat_id,
+                        "row_count": rows["c"],
+                        "total_amount": rows["s"],
+                        "partition": partition,
+                    },
+                )
+            except AuditMissing as exc:
+                raise HTTPException(500, str(exc)) from exc
             return {
+                "mat_id": mat_id,
                 "row_count": rows["c"],
                 "total_amount": rows["s"],
                 "partition_key": partition,
@@ -87,7 +113,7 @@ def partition_stub(authorization: AuthHeader = None):
     """空桩模块：部分物化失败回滚策略待题面落地。"""
     user = require_user(authorization)
     with connect() as conn:
-        write_audit(
+        commit_with_audit(
             conn,
             user,
             "partition_mat_stub",
@@ -100,5 +126,4 @@ def partition_stub(authorization: AuthHeader = None):
                 "note": "正确性口径须择一，母仓不实现",
             },
         )
-        conn.commit()
     return {"ok": True, "stub": True, "module": "partition_mat"}

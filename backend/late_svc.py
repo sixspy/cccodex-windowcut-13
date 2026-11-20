@@ -6,9 +6,10 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from audit_gate import AuditMissing, commit_with_audit
 from auth import AuthHeader, require_user
-from db import connect, write_audit
-from locks import release, require_lock
+from db import connect
+from locks import deny_on_contention, release
 
 router = APIRouter(tags=["late"])
 
@@ -52,29 +53,33 @@ def promote_stub(body: LatePromoteIn, authorization: AuthHeader = None):
     user = require_user(authorization)
     lock_key = f"late-promote:{body.late_id}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        deny_on_contention(conn, lock_key, user, biz_action="late_promote_stub")
         try:
             late = conn.execute(
                 "SELECT * FROM late_bucket WHERE id=?", (body.late_id,)
             ).fetchone()
             if not late:
+                conn.rollback()
                 raise HTTPException(404, "迟到记录不存在")
             w = conn.execute(
                 "SELECT * FROM windows WHERE name=?", (body.target_window_name,)
             ).fetchone()
             if not w:
+                conn.rollback()
                 raise HTTPException(404, "目标窗口不存在")
-            write_audit(
-                conn,
-                user,
-                "late_promote_stub",
-                str(body.late_id),
-                {
-                    "target": body.target_window_name,
-                    "note": "空桩：未改正式窗内事件，待题面写路径落地",
-                },
-            )
-            conn.commit()
+            try:
+                commit_with_audit(
+                    conn,
+                    user,
+                    "late_promote_stub",
+                    str(body.late_id),
+                    {
+                        "target": body.target_window_name,
+                        "note": "空桩：未改正式窗内事件，待题面写路径落地",
+                    },
+                )
+            except AuditMissing as exc:
+                raise HTTPException(500, str(exc)) from exc
             return {
                 "ok": True,
                 "stub": True,
@@ -95,12 +100,11 @@ def discard_stub(late_id: int, authorization: AuthHeader = None):
         ).fetchone()
         if not late:
             raise HTTPException(404, "迟到记录不存在")
-        write_audit(
+        commit_with_audit(
             conn,
             user,
             "late_discard_stub",
             str(late_id),
             {"biz_key": late["biz_key"], "at": datetime.now().isoformat(timespec="seconds")},
         )
-        conn.commit()
     return {"ok": True, "stub": True}

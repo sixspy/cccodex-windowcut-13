@@ -29,6 +29,9 @@ createApp({
     const locks = ref([]);
     const holds = ref([]);
     const dash = ref({});
+    const proof = ref({ aligned: true, families: [] });
+    const actionSummary = ref([]);
+    const sessions = ref([]);
     const form = ref({
       window_name: "W-1102",
       biz_key: "ORD-9",
@@ -100,6 +103,15 @@ createApp({
       const au = await api.get("/api/audit?limit=50");
       if (au === null) return;
       audits.value = Array.isArray(au.body.items) ? au.body.items : [];
+      const acts = await api.get("/api/audit/actions");
+      if (acts === null) return;
+      actionSummary.value = Array.isArray(acts.body.items) ? acts.body.items : [];
+      const pf = await api.get("/api/audit/proof");
+      if (pf === null) return;
+      proof.value = pf.body || { aligned: true, families: [] };
+      const ss = await api.get("/api/sessions");
+      if (ss === null) return;
+      sessions.value = Array.isArray(ss.body.items) ? ss.body.items : [];
       const ct = await api.get("/api/contention");
       if (ct === null) return;
       contention.value = Array.isArray(ct.body.items) ? ct.body.items : [];
@@ -209,11 +221,17 @@ createApp({
       locks,
       holds,
       dash,
+      proof,
+      actionSummary,
+      sessions,
       form,
       holdForm,
       actionErr,
       lateEvents: computed(() =>
         (events.value || []).filter((e) => e.disposition === "迟到桶")
+      ),
+      proofGaps: computed(() =>
+        (proof.value.families || []).flatMap((f) => f.gaps || [])
       ),
       login,
       logout,

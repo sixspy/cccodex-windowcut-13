@@ -41,6 +41,13 @@ def sha_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
+def sha_token(token: str) -> str:
+    """会话 token 不落明文，只存 sha256 指纹用于互证。"""
+    import hashlib
+
+    return hashlib.sha256(("session:" + token).encode("utf-8")).hexdigest()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   username TEXT PRIMARY KEY,
@@ -114,6 +121,15 @@ CREATE TABLE IF NOT EXISTS audit_trail(
   target TEXT,
   payload TEXT,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  token_sha TEXT UNIQUE NOT NULL,
+  role TEXT,
+  status TEXT NOT NULL DEFAULT '有效',
+  login_at TEXT NOT NULL,
+  logout_at TEXT
 );
 CREATE TABLE IF NOT EXISTS reopen_ledger(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -255,6 +271,15 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         ensure_users(conn)
         seed_if_empty(conn)
+        fixed = backfill_audit_holes(conn)
+        if any(fixed.values()):
+            write_audit(
+                conn,
+                "system",
+                "audit_backfill",
+                "audit_trail",
+                {"fixed": fixed, "path": "startup_migration"},
+            )
         conn.commit()
 
 
@@ -265,11 +290,76 @@ def write_audit(
     target: str | None = None,
     payload: dict | None = None,
     created_at: str | None = None,
-) -> None:
+) -> int:
+    """插入审计行并返回行 id。甲路径下只允许在业务事务内调用，
+    提交口在 audit_svc.commit_with_audit（同事务回查 + 强制回滚）。"""
     from datetime import datetime
 
     now = created_at or datetime.now().isoformat(timespec="seconds")
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO audit_trail(actor,action,target,payload,created_at) VALUES (?,?,?,?,?)",
         (actor, action, target, json.dumps(payload or {}, ensure_ascii=False), now),
     )
+    return int(cur.lastrowid)
+
+
+def backfill_audit_holes(conn: sqlite3.Connection) -> dict[str, int]:
+    """一次性历史空洞补齐（启动迁移，非乙路径运行期补偿）：
+    为没有 materialize_ok 审计互证的物化行补登记，带 backfill=true 标记。
+    幂等：已补过的物化行不重复补。"""
+    from datetime import datetime
+
+    fixed = {"materializations": 0, "contention": 0}
+    now = datetime.now().isoformat(timespec="seconds")
+    mats = conn.execute(
+        "SELECT id, window_id, status, row_count, total_amount, partition_key, created_at "
+        "FROM materializations ORDER BY id"
+    ).fetchall()
+    for m in mats:
+        hit = conn.execute(
+            "SELECT 1 FROM audit_trail WHERE action='materialize_ok' AND payload LIKE ? LIMIT 1",
+            (f'%"mat_id": {m["id"]}%',),
+        ).fetchone()
+        if hit:
+            continue
+        write_audit(
+            conn,
+            "system",
+            "materialize_ok",
+            str(m["window_id"]),
+            {
+                "mat_id": m["id"],
+                "partition": m["partition_key"],
+                "row_count": m["row_count"],
+                "total_amount": m["total_amount"],
+                "backfill": True,
+                "backfill_at": now,
+            },
+            created_at=m["created_at"],
+        )
+        fixed["materializations"] += 1
+
+    conts = conn.execute("SELECT * FROM contention_log ORDER BY id").fetchall()
+    for ct in conts:
+        hit = conn.execute(
+            "SELECT 1 FROM audit_trail WHERE action='lock_contention' AND payload LIKE ? LIMIT 1",
+            (f'%"contention_id": {ct["id"]}%',),
+        ).fetchone()
+        if hit:
+            continue
+        write_audit(
+            conn,
+            ct["actor"],
+            "lock_contention",
+            ct["lock_key"],
+            {
+                "contention_id": ct["id"],
+                "path": "backfill",
+                "holder": None,
+                "backfill": True,
+                "backfill_at": now,
+            },
+            created_at=ct["created_at"],
+        )
+        fixed["contention"] += 1
+    return fixed
